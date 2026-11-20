@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+#
+# start-llama-profile - run llama.cpp's llama-server with parameters loaded
+# from a profile file.
+#
+# Profile files live in the XDG user config directory:
+#
+#     ${XDG_CONFIG_HOME:-$HOME/.config}/llama-cpp/profiles/
+#
+# Profile selection (command line wins over the environment):
+#
+#     1. first non-option argument:  start-llama-profile <profile> [args...]
+#     2. the LLAMA_PROFILE environment variable
+#
+# Arguments after the profile name are appended after the profile's
+# parameters and therefore override them (llama-server honors the last
+# occurrence of a repeated option).
+#
+# Profile file syntax (shlex-like):
+#
+#     whitespace      separates arguments
+#     single quotes   literal text, no escapes
+#     double quotes   allow the escapes \n \t \" \\
+#     backslash       escapes the next character
+#     #               starts a comment up to the end of the line
+#     quotes must not span multiple lines
+#
+# Environment:
+#
+#     LLAMA_PROFILE     profile to use when none is given as an argument
+#     LLAMA_SERVER_BIN  llama-server binary to run (default: llama-server)
+
+set -euo pipefail
+
+PROG=$(basename -- "$0")
+
+die()  { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [PROFILE] [llama-server arguments...]
+
+Run llama.cpp's llama-server with the parameters from a profile file.
+The profile is taken from PROFILE or, if no PROFILE argument is given,
+from the LLAMA_PROFILE environment variable (command line wins).
+
+Profile files are searched in (name or name.profile both accepted):
+    $PROFILE_DIR
+
+Options (before the profile name):
+  -h, --help             show this help and exit
+  -l, --list             list available profiles and exit
+      --dry-run          print the command line that would be run
+      --profile-dir DIR  override the profile directory
+
+Environment:
+  LLAMA_PROFILE          profile to use when none is given as an argument
+  LLAMA_SERVER_BIN       llama-server binary to run (default: llama-server)
+
+Examples:
+  $PROG basic
+  $PROG basic --port 8081
+  LLAMA_PROFILE=chat $PROG -m /models/llama-3-8b-instruct.gguf
+  $PROG -- -m /models/model.gguf      # profile from \$LLAMA_PROFILE
+EOF
+}
+
+# XDG user config directory: XDG_CONFIG_HOME if set, else ~/.config
+config_home() {
+  local dir=${XDG_CONFIG_HOME:-}
+  if [[ -z $dir ]]; then
+    dir=$HOME/.config
+  else
+    dir=${dir/#\~/$HOME}
+  fi
+  printf '%s' "$dir"
+}
+
+list_profiles() {
+  printf 'Profiles in %s:\n' "$PROFILE_DIR"
+  local f found=0
+  for f in "$PROFILE_DIR"/*; do
+    if [[ -f $f ]]; then
+      printf '  %s\n' "$(basename -- "$f")"
+      found=1
+    fi
+  done
+  if (( ! found )); then
+    printf '  (none)\n'
+  fi
+  return 0
+}
+
+# Parse a profile file into the global array PROFILE_ARGS.
+parse_profile() {
+  local file=$1
+  local -a tokens=()
+  local line no=0 i len c n cur in_s in_d started
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    no=$((no + 1))
+    cur= in_s=0 in_d=0 started=0
+    i=0
+    len=${#line}
+
+    while (( i < len )); do
+      c=${line:i:1}
+      if (( in_s )); then
+        if [[ $c == "'" ]]; then
+          in_s=0
+        else
+          cur+=$c
+        fi
+      elif (( in_d )); then
+        if [[ $c == '"' ]]; then
+          in_d=0
+        elif [[ $c == '\' && $((i + 1)) -lt $len ]]; then
+          n=${line:i+1:1}
+          case $n in
+            n) cur+=$'\n' ;;
+            t) cur+=$'\t' ;;
+            *) cur+=$n ;;
+          esac
+          i=$((i + 1))
+        else
+          cur+=$c
+        fi
+      else
+        case $c in
+          '"') in_d=1; started=1 ;;
+          "'") in_s=1; started=1 ;;
+          '#') break ;;
+          ' '|$'\t')
+            if (( started )); then
+              tokens+=("$cur")
+              cur=
+              started=0
+            fi
+            ;;
+          '\')
+            if (( i + 1 < len )); then
+              cur+=${line:i+1:1}
+              i=$((i + 1))
+            else
+              cur+="\""; started=1
+            fi
+            ;;
+          *) cur+=$c; started=1 ;;
+        esac
+      fi
+      i=$((i + 1))
+    done
+
+    if (( started )); then
+      tokens+=("$cur")
+    fi
+    if (( in_s || in_d )); then
+      warn "line $no: unterminated quote, rest of line taken literally"
+    fi
+  done < "$file"
+
+  PROFILE_ARGS=()
+  if (( ${#tokens[@]} > 0 )); then
+    PROFILE_ARGS=("${tokens[@]}")
+  fi
+}
+
+main() {
+  PROFILE_DIR=$(config_home)/llama-cpp/profiles
+  PROFILE_ARGS=()
+
+  local profile_name= profile_source= profile_file= dry_run=0 mode=scan
+  local -a server_args=()
+
+  while (( $# > 0 )); do
+    if [[ $mode == server ]]; then
+      server_args+=("$1")
+      shift
+      continue
+    fi
+
+    case $1 in
+      --)
+        shift
+        while (( $# > 0 )); do
+          server_args+=("$1")
+          shift
+        done
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -l|--list)
+        list_profiles
+        exit 0
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --profile-dir)
+        if (( $# < 2 )); then
+          die "--profile-dir requires a directory argument"
+        fi
+        PROFILE_DIR=$2
+        shift 2
+        ;;
+      -*)
+        if [[ -n ${LLAMA_PROFILE:-} ]]; then
+          mode=server
+          server_args+=("$1")
+          shift
+        else
+          die "unknown option: $1 (see: $PROG --help)"
+        fi
+        ;;
+      *)
+        profile_name=$1
+        profile_source="command line"
+        mode=server
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z $profile_name ]]; then
+    if [[ -n ${LLAMA_PROFILE:-} ]]; then
+      profile_name=$LLAMA_PROFILE
+      profile_source="env var LLAMA_PROFILE"
+    else
+      list_profiles >&2
+      die "no profile given (pass one as an argument or set LLAMA_PROFILE; see: $PROG --help)"
+    fi
+  elif [[ -n ${LLAMA_PROFILE:-} && $LLAMA_PROFILE != $profile_name ]]; then
+    warn "using profile '$profile_name' from the command line, ignoring LLAMA_PROFILE='$LLAMA_PROFILE'"
+  fi
+
+  if [[ $profile_name == */* || $profile_name == ~* ]]; then
+    profile_file=${profile_name/#\~/$HOME}
+    if [[ ! -f $profile_file || ! -r $profile_file ]]; then
+      die "profile file not found or not readable: $profile_file"
+    fi
+  elif [[ -f $PROFILE_DIR/$profile_name && -r $PROFILE_DIR/$profile_name ]]; then
+    profile_file=$PROFILE_DIR/$profile_name
+  elif [[ -f $PROFILE_DIR/$profile_name.profile && -r $PROFILE_DIR/$profile_name.profile ]]; then
+    profile_file=$PROFILE_DIR/$profile_name.profile
+  else
+    list_profiles >&2
+    die "profile '$profile_name' not found in $PROFILE_DIR"
+  fi
+
+  parse_profile "$profile_file"
+
+  local bin=${LLAMA_SERVER_BIN:-llama-server}
+  if ! command -v "$bin" > /dev/null; then
+    die "llama-server binary not found: '$bin' (set LLAMA_SERVER_BIN or put it in PATH)"
+  fi
+
+  local -a cmd=("$bin")
+  if (( ${#PROFILE_ARGS[@]} > 0 )); then
+    cmd+=("${PROFILE_ARGS[@]}")
+  fi
+  if (( ${#server_args[@]} > 0 )); then
+    cmd+=("${server_args[@]}")
+  fi
+
+  printf '%s: profile %s (%s)\n' "$PROG" "$profile_file" "$profile_source" >&2
+
+  if (( dry_run )); then
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+    exit 0
+  fi
+
+  exec -- "${cmd[@]}"
+}
+
+main "$@"
